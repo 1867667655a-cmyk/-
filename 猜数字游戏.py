@@ -1,0 +1,302 @@
+import sys
+import random
+import re
+import os
+import pygame
+import syncedlyrics
+from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics
+
+class LyricInstance:
+    def __init__(self, text, start_t, end_t, screen_w, screen_h, font,
+                 is_special=False, color=(255, 80, 80), segments=None):
+        # 如果提供了分段信息，则使用分段；否则用单一文本和颜色构建分段
+        if segments:
+            self.segments = segments
+            self.full_text = "".join(t for t, _ in segments)  # 完整文本（无括号）
+        else:
+            self.segments = [(text, color)]
+            self.full_text = text
+
+        self.start_t = start_t
+        self.display_text = ""
+        self.alpha = 0
+        self.is_dead = False
+        self.is_special = is_special
+
+        self.fade_in_s = 0.3
+        self.fade_out_s = 1.2
+        self.type_speed = 0.08
+
+        if is_special:
+            self.font = QFont(font.family(), font.pointSize() * 3, font.weight())
+            self.step_y = 0
+            self.end_t = end_t + 2.0
+        else:
+            self.font = font
+            self.step_y = random.uniform(-5.5, 5.5) 
+            self.end_t = end_t
+
+        metrics = QFontMetrics(self.font)
+        text_w = metrics.horizontalAdvance(self.full_text)
+        text_h = metrics.height()
+
+        if is_special:
+            self.x = (screen_w - text_w) / 2
+            self.y = screen_h * 0.2
+        else:
+            margin = 150
+            max_x = max(margin, screen_w - text_w - margin)
+            max_y = max(margin, screen_h - text_h - margin)
+            self.x = random.randint(margin, int(max_x))
+            self.y = random.randint(margin, int(max_y))
+
+    def update(self, now):
+        if now < self.start_t:
+            self.alpha = 0
+        elif now < self.start_t + self.fade_in_s:
+            self.alpha = int(((now - self.start_t) / self.fade_in_s) * 255)
+        elif now < self.end_t:
+            self.alpha = 255
+        elif now < self.end_t + self.fade_out_s:
+            ratio = (self.end_t + self.fade_out_s - now) / self.fade_out_s
+            self.alpha = max(0, int(ratio * 255))
+        else:
+            self.alpha = 0
+            self.is_dead = True
+
+        if now > self.start_t:
+            chars = int((now - self.start_t) / self.type_speed)
+            self.display_text = self.full_text[:chars]
+
+
+class UltimateRedOverlay(QWidget):
+    def __init__(self, song_query, audio_path):
+        super().__init__()
+
+        pygame.mixer.init()
+        try:
+            sound_check = pygame.mixer.Sound(audio_path)
+            self.duration = sound_check.get_length()
+            pygame.mixer.music.load(audio_path)
+            pygame.mixer.music.play(-1)
+        except Exception as e:
+            print(f"音频加载失败: {e}")
+            self.duration = 300
+
+        self.lyrics_data = self.fetch_lyrics(song_query)
+        self.last_now = 0
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool |
+            Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.showFullScreen()
+
+        self.normal_font = QFont("Microsoft YaHei UI", 26, QFont.Weight.Bold)
+        self.active_lyrics = []
+        self.processed_indices = set()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_logic)
+        self.timer.start(16)
+
+    def fetch_lyrics(self, query):
+        """本地优先加载歌词，否则联网下载（保持不变）"""
+        clean_name = re.sub(r'[\\/:*?"<>|]', '_', query)
+        lrc_filename = f"{clean_name}.lrc"
+
+        lrc_content = None
+
+        if os.path.exists(lrc_filename):
+            print(f"检测到本地歌词文件: {lrc_filename}")
+            try:
+                with open(lrc_filename, "r", encoding="utf-8") as f:
+                    lrc_content = f.read()
+            except Exception as e:
+                print(f"读取本地文件失败: {e}")
+
+        if not lrc_content:
+            print(f"本地无歌词，正在联网搜索: {query}...")
+            try:
+                lrc_content = syncedlyrics.search(query)
+                if lrc_content:
+                    with open(lrc_filename, "w", encoding="utf-8") as f:
+                        f.write(lrc_content)
+                    print(f"歌词下载成功并已保存至: {lrc_filename}")
+            except Exception as e:
+                print(f"在线搜索出错: {e}")
+
+        if not lrc_content:
+            return [(0, 10, "未找到歌词文件")]
+
+        data = []
+        pattern = re.compile(r'\[(\d+):(\d+(?:\.\d+)?)\](.*)')
+
+        for line in lrc_content.splitlines():
+            m = pattern.match(line)
+            if m:
+                try:
+                    t = int(m.group(1)) * 60 + float(m.group(2))
+                    txt = m.group(3).strip()
+                    if txt:
+                        data.append([t, txt])
+                except:
+                    continue
+
+        if not data:
+            return [(0, 10, "歌词解析失败")]
+
+        res = []
+        for i in range(len(data)):
+            start = data[i][0]
+            end = data[i+1][0] if i < len(data)-1 else start + 5.0
+            res.append((start, end, data[i][1]))
+        return res
+
+    def refresh_logic(self):
+        raw_pos = pygame.mixer.music.get_pos() / 1000.0
+        if raw_pos < 0:
+            return
+        now = raw_pos % self.duration
+
+        if now < self.last_now - 1.0:
+            self.processed_indices.clear()
+            self.active_lyrics.clear()
+        self.last_now = now
+
+        for i, (start, end, text) in enumerate(self.lyrics_data):
+            if start <= now <= end and i not in self.processed_indices:
+                self.processed_indices.add(i)
+
+                sw, sh = self.width(), self.height()
+
+                # 特殊歌词
+                if text == "B y  d e f a u l t":
+                    lyric = LyricInstance(text, start, end, sw, sh, self.normal_font,
+                                          is_special=True)
+                    self.active_lyrics.append(lyric)
+                    continue
+
+                # 1. 处理大括号 { ... } ，延长至下下句才消失
+                brace_contents = re.findall(r'\{([^{}]*)\}', text)
+                for sub in brace_contents:
+                    sub = sub.strip()
+                    if sub:
+                        if i + 2 < len(self.lyrics_data):
+                            next_next_start = self.lyrics_data[i + 2][0]
+                        else:
+                            next_next_start = end
+                        brace_lyric = LyricInstance(sub, start, next_next_start, sw, sh,
+                                                    self.normal_font)   # 默认红色
+                        self.active_lyrics.append(brace_lyric)
+
+                # 2. 去掉大括号部分，得到剩余文本（避免重复绘制）
+                base_text = re.sub(r'\{[^{}]*\}', '', text)
+
+                # 3. 圆括号处理（独立白色实例，保持不变）
+                paren_texts = re.findall(r'\(([^()]*)\)', base_text)
+                base_text_no_paren = re.sub(r'\([^()]*\)', '', base_text)
+
+                for sub in paren_texts:
+                    sub = sub.strip()
+                    if sub:
+                        paren_lyric = LyricInstance(sub, start, end, sw, sh, self.normal_font,
+                                                    color=(255, 255, 255))
+                        self.active_lyrics.append(paren_lyric)
+
+                # 4. 中括号颜色分段（红色 + 白色），完全保持原样
+                segments = []
+                plain = ""
+                idx = 0
+                while idx < len(base_text_no_paren):
+                    ch = base_text_no_paren[idx]
+                    if ch == '[':
+                        if plain:
+                            segments.append((plain, (255, 80, 80)))
+                            plain = ""
+                        j = base_text_no_paren.find(']', idx)
+                        if j != -1:
+                            bracket_content = base_text_no_paren[idx+1:j]
+                            if bracket_content:
+                                segments.append((bracket_content, (255, 255, 255)))
+                            idx = j + 1
+                            continue
+                    plain += ch
+                    idx += 1
+
+                if plain:
+                    segments.append((plain, (255, 80, 80)))
+
+                if segments:
+                    main_lyric = LyricInstance("", start, end, sw, sh, self.normal_font,
+                                               segments=segments)
+                    self.active_lyrics.append(main_lyric)
+
+        # 更新所有活跃歌词
+        for lyric in self.active_lyrics[:]:
+            lyric.update(now)
+            if lyric.is_dead:
+                self.active_lyrics.remove(lyric)
+
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+        for lyric in self.active_lyrics:
+            if lyric.alpha <= 0:
+                continue
+
+            painter.save()
+            painter.setFont(lyric.font)
+
+            x = lyric.x
+            y = lyric.y
+            step = lyric.step_y
+            alpha = lyric.alpha
+            shadow_alpha = int(alpha * 0.6)
+
+            metrics = QFontMetrics(lyric.font)
+            displayed_chars = len(lyric.display_text)
+
+            # 逐字绘制，根据分段信息着色
+            char_idx = 0
+            for seg_text, seg_color in lyric.segments:
+                seg_len = len(seg_text)
+                # 这一段的结束索引（在完整文本中的位置）
+                seg_end = char_idx + seg_len
+                # 当前显示覆盖到这一段的字符数
+                if displayed_chars <= char_idx:
+                    break   # 还没轮到这段
+                # 这一段的可见字符数
+                visible_len = min(displayed_chars, seg_end) - char_idx
+
+                for i in range(visible_len):
+                    ch = seg_text[i]
+                    # 阴影
+                    painter.setPen(QColor(50, 0, 0, shadow_alpha))
+                    painter.drawText(int(x) + 2, int(y) + 2, ch)
+                    # 主文字（段颜色）
+                    r, g, b = seg_color
+                    painter.setPen(QColor(r, g, b, alpha))
+                    painter.drawText(int(x), int(y), ch)
+
+                    x += metrics.horizontalAdvance(ch)
+                    y += step
+
+                char_idx = seg_end
+
+            painter.restore()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = UltimateRedOverlay("Mili Mili In Hell We Live, Lament", "InHellWeLiveLament.wav")
+    sys.exit(app.exec())
